@@ -149,7 +149,7 @@ struct morse_tx morse_tx_table[] = {
 };
 
 // 256-entry look-up table gets filled from morse tx table above
-static const char *morse_lut[256];
+static char *morse_lut[256];
 
 struct morse_rx {
 	char *c;
