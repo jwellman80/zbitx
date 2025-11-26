@@ -271,7 +271,7 @@ static float cw_envelope = 1;		//used to shape the envelope
 static int cw_tx_until = 0;			//delay switching to rx, expect more txing
 static int data_tx_until = 0;
 
-static const char *symbol_next = NULL;
+static char *symbol_next = NULL;
 pthread_t iambic_thread;
 char iambic_symbol[4];
 char cw_symbol_prev = ' ';
@@ -473,6 +473,7 @@ float cw_tx_get_sample(){
 				keydown_count = cw_period * 3;
 				keyup_count = cw_period;
 			}
+			cw_last_symbol = CW_DOT_DELAY;
 			cw_next_symbol = CW_IDLE;
 		}
 		if (cw_mode == CW_IAMBICB){
