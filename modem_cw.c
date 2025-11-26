@@ -518,14 +518,14 @@ float cw_tx_get_sample(){
 
 	// TX self-monitoring: track keying state to decode what we're sending
 	// Only monitor paddle/key input, not keyboard/macro (which already shows typed chars)
-	int should_monitor = (cw_mode != CW_KBD && cw_current_symbol != CW_IDLE);
+	int should_monitor = (cw_mode != CW_KBD);
 	int current_key_state = (keydown_count > 0) ? 1 : 0;
 
 	if (should_monitor) {
 		// Detect key down transition
 		if (current_key_state == 1 && tx_monitor_last_state == 0) {
-			// Key just went down - check if we had a character gap (2.5+ dot lengths)
-			if (tx_monitor_key_up_time > tx_monitor_dot_len * 2) {
+			// Key just went down - check if we had a character gap (1.8+ dot lengths)
+			if (tx_monitor_key_up_time > (tx_monitor_dot_len * 9 / 5)) {
 				// Character gap detected - decode what we have
 				tx_monitor_decode();
 			}
@@ -535,13 +535,14 @@ float cw_tx_get_sample(){
 		// Detect key up transition
 		else if (current_key_state == 0 && tx_monitor_last_state == 1) {
 			// Key just went up - determine if it was a dot or dash
-			if (tx_monitor_key_down_time >= tx_monitor_dot_len * 2) {
+			// Dash threshold: 1.8x dot length (between 1 and 3)
+			if (tx_monitor_key_down_time >= (tx_monitor_dot_len * 9 / 5)) {
 				// It was a dash
 				if (tx_monitor_pos < sizeof(tx_monitor_code) - 1) {
 					tx_monitor_code[tx_monitor_pos++] = '-';
 				}
-			} else if (tx_monitor_key_down_time >= tx_monitor_dot_len / 2) {
-				// It was a dot
+			} else if (tx_monitor_key_down_time >= (tx_monitor_dot_len / 3)) {
+				// It was a dot (minimum 1/3 dot length to filter noise)
 				if (tx_monitor_pos < sizeof(tx_monitor_code) - 1) {
 					tx_monitor_code[tx_monitor_pos++] = '.';
 				}
