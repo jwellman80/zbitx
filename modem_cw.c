@@ -145,8 +145,11 @@ struct morse_tx morse_tx_table[] = {
 	{'+', ".-.-."},
 	{'&', "-...-"},
 	{'\'', "--..--"},
-	{'=', "-...-.-"}, 
+	{'=', "-...-.-"},
 };
+
+// 256-entry look-up table gets filled from morse tx table above
+static const char *morse_lut[256];
 
 struct morse_rx {
 	char *c;
@@ -255,6 +258,7 @@ struct cw_decoder{
 
 struct cw_decoder decoder;
 #define FLOAT_SCALE (1073741824.0)
+#define INV_FLOAT_SCALE (1.0/1073741824.0)  // Pre-compute inverse for faster multiplication
 
 /* cw tx state variables */
 static unsigned long millis_now = 0;
@@ -279,6 +283,35 @@ static uint8_t cw_mode = CW_STRAIGHT;
 static int cw_bytes_available = 0; //chars available in the tx queue
 #define CW_MAX_SYMBOLS 12
 char cw_key_letter[CW_MAX_SYMBOLS];
+
+// Performance optimizations - moved out of real-time sample generation
+#define CW_CONSOLE_QUEUE_SIZE 256
+static char cw_console_queue[CW_CONSOLE_QUEUE_SIZE];
+static volatile int cw_console_queue_head = 0;
+static volatile int cw_console_queue_tail = 0;
+static char last_queued_char = '\0';
+
+static int cached_pitch = 700;  // Cache to avoid 96k get_pitch() calls/sec
+static int cached_cw_delay = 100;  // Cache to avoid repeated get_cw_delay() calls
+
+// build the look-up table from morse_tx_table; called once during initialization
+static void cw_init_morse_lut(void)
+{
+    for (int i = 0; i < 256; ++i)
+        morse_lut[i] = NULL;
+
+    const size_t n = sizeof(morse_tx_table) / sizeof(morse_tx_table[0]);
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char ch = (unsigned char)morse_tx_table[i].c;
+        morse_lut[ch] = morse_tx_table[i].code;
+        // also map uppercase letters if entry is lowercase a–z
+        if (ch >= 'a' && ch <= 'z') {
+            morse_lut[(unsigned char)(ch - 'a' + 'A')] = morse_tx_table[i].code;
+        }
+    }
+    // just make sure space is mapped
+    morse_lut[(unsigned char)' '] = " ";
+}
 
 //the of morse code needs to translate into CW_DOT, CW_DASH, etc
 static uint8_t cw_get_next_symbol(){
@@ -310,55 +343,57 @@ static uint8_t cw_get_next_symbol(){
 //and we only read the status from the variable updated by modem_poll()
 
 static int cw_read_key(){
-	char c;
-
 	int cw_key_state = key_poll();
 
-	//preferance to the keyer activity
-	if (cw_key_state != CW_IDLE) {
-		//return cw_key_state;
-		//cw_key_state = key_poll();
+	//preference to the keyer activity
+	if (cw_key_state != CW_IDLE)
 		return cw_key_state;
-	}
 
 	if (cw_current_symbol != CW_IDLE)
 		return CW_IDLE;
 
 	//we are still sending the previously typed character..
-	if (symbol_next){
-		uint8_t s = cw_get_next_symbol();
-		return s;
-	}
+	if (symbol_next)
+		return cw_get_next_symbol();
 
 	//return if a symbol is being transmitted
 	if (cw_bytes_available == 0)
 		return CW_IDLE;
 
+	char c;
 	get_tx_data_byte(&c);
-	symbol_next = morse_tx_table->code; // point to the first symbol, by default
 
-	for (int i = 0; i < sizeof(morse_tx_table)/sizeof(struct morse_tx); i++)
-		if (morse_tx_table[i].c == tolower(c)){
-			symbol_next = morse_tx_table[i].code;
-			char buff[5];
-			buff[0] = toupper(c);
-			buff[1] = 0;
-			write_console(FONT_CW_TX, buff);
+	const unsigned char uc = (unsigned char)c;
+	// fast lookup; table contains lowercase entries, and we also mapped uppercase
+	symbol_next = morse_lut[uc];
+
+	if (symbol_next) {
+		// Queue character for console - moved out of real-time path for performance
+		char display_char = (char)toupper(uc);
+		if (display_char != last_queued_char) {
+			int next_head = (cw_console_queue_head + 1) % CW_CONSOLE_QUEUE_SIZE;
+			if (next_head != cw_console_queue_tail) {
+				cw_console_queue[cw_console_queue_head] = display_char;
+				cw_console_queue_head = next_head;
+				last_queued_char = display_char;
+			}
 		}
-	if (symbol_next)
-		return cw_get_next_symbol(); 
-	else
+		return cw_get_next_symbol();
+	} else {
+		// unknown character: ignore
 		return CW_IDLE;
+	}
 }
 
 float cw_tx_get_sample(){
 	float sample = 0;
 
-	// for now, updatw time and cw pitch
+	// for now, update time and cw pitch
 	if (!keydown_count && !keyup_count){
 		millis_now = sbitx_millis();
-		if (cw_tone.freq_hz != get_pitch())
-			vfo_start(&cw_tone, get_pitch(), 0);
+		// set CW pitch if needed, using cached value
+		if (cached_pitch != -1 && cw_tone.freq_hz != cached_pitch)
+			vfo_start(&cw_tone, cached_pitch, 0);
 	}
 
 	uint8_t symbol_now = cw_read_key();
@@ -465,12 +500,12 @@ float cw_tx_get_sample(){
 			keyup_count--;
 	}
 
-	sample = (vfo_read(&cw_tone)/FLOAT_SCALE) * cw_envelope;
+	sample = ((vfo_read(&cw_tone) * INV_FLOAT_SCALE) * cw_envelope) * 0.125;  // Optimized: multiply instead of divide
 
 	if (keyup_count > 0 || keydown_count > 0){
-		cw_tx_until = millis_now + get_cw_delay(); 
+		cw_tx_until = millis_now + cached_cw_delay;
 	}
-	return sample / 8;
+	return sample;
 }
 
 
@@ -717,7 +752,7 @@ void cw_rx(int32_t *samples, int count){
 	 For those transmitting at higher than 40 wpm, .. some other day
 */
 
-void cw_init(){	
+void cw_init(){
 	//cw rx initializeation
 	decoder.ticker = 0;
 	decoder.n_bins = N_BINS;
@@ -730,13 +765,14 @@ void cw_init(){
 	decoder.wpm = 12;
 
 	// dot len (in msec)) = 1200/wpm; dash len = 3600/wpm
-	// each block of nbins = n_bins/sampling seconds; 
-	// dash len is (3600 / wpm)/ ((nbins * 1000)/samping_freq) 
-	decoder.dash_len = (18 * SAMPLING_FREQ) / (5 * N_BINS* INIT_WPM); 
+	// each block of nbins = n_bins/sampling seconds;
+	// dash len is (3600 / wpm)/ ((nbins * 1000)/samping_freq)
+	decoder.dash_len = (18 * SAMPLING_FREQ) / (5 * N_BINS* INIT_WPM);
 
 	cw_rx_bin_init(&decoder.signal, INIT_TONE, N_BINS, SAMPLING_FREQ);
-	
-	//init cw tx with some reasonable values
+
+	// cw tx initialization
+	cw_init_morse_lut();    // build TX Morse code look-up table
 	vfo_start(&cw_env, 50, 49044); //start in the third quardrant, 270 degree
 	vfo_start(&cw_tone, 700, 0);
 	cw_period = 9600; 		// At 96ksps, 0.1sec = 1 dot at 12wpm
@@ -747,28 +783,43 @@ void cw_init(){
 }
 
 void cw_poll(int bytes_available, int tx_is_on){
+	// Flush console queue (moved out of real-time sample generation)
+	while (cw_console_queue_tail != cw_console_queue_head) {
+		char buff[2];
+		buff[0] = cw_console_queue[cw_console_queue_tail];
+		buff[1] = 0;
+		write_console(FONT_CW_TX, buff);
+		cw_console_queue_tail = (cw_console_queue_tail + 1) % CW_CONSOLE_QUEUE_SIZE;
+	}
+	// Reset duplicate tracker after queue is empty
+	if (cw_console_queue_tail == cw_console_queue_head) {
+		last_queued_char = '\0';
+	}
+
 	cw_bytes_available = bytes_available;
 	int wpm  = field_int("WPM");
 	cw_period = (12 * 9600)/wpm;
 
-	//retune the rx pitch if needed
+	//retune the rx pitch if needed and update cached TX pitch
 	int cw_rx_pitch = field_int("PITCH");
+	cached_pitch = cw_rx_pitch;  // Update cache to avoid 96k calls/sec in sample generation
+	cached_cw_delay = get_cw_delay();  // Update CW delay cache
 	if (cw_rx_pitch != decoder.signal.freq)
 		cw_rx_bin_init(&decoder.signal, cw_rx_pitch, N_BINS, SAMPLING_FREQ);
 
 	// check if the wpm has changed
 	if (wpm != decoder.wpm){
 		decoder.wpm = wpm;
-		decoder.dash_len = (18 * SAMPLING_FREQ) / (5 * N_BINS* wpm); 
-	}	
+		decoder.dash_len = (18 * SAMPLING_FREQ) / (5 * N_BINS* wpm);
+	}
 
 	// TX ON if bytes are avaiable (from macro/keyboard) or key is pressed
-	// of we are in the middle of symbol (dah/dit) transmission 
+	// of we are in the middle of symbol (dah/dit) transmission
 
 	if (!tx_is_on && (cw_bytes_available || key_poll() || (symbol_next && *symbol_next)) > 0){
 		tx_on(TX_SOFT);
 		millis_now = millis();
-		cw_tx_until = get_cw_delay() + millis_now;
+		cw_tx_until = cached_cw_delay + millis_now;
 		cw_mode = get_cw_input_method();
 	}
 	else if (tx_is_on && cw_tx_until < millis_now){
