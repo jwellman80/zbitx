@@ -294,6 +294,14 @@ static char last_queued_char = '\0';
 static int cached_pitch = 700;  // Cache to avoid 96k get_pitch() calls/sec
 static int cached_cw_delay = 100;  // Cache to avoid repeated get_cw_delay() calls
 
+// TX self-monitoring/decoding variables
+static char tx_monitor_code[20];  // Buffer to build up dots and dashes
+static int tx_monitor_pos = 0;
+static int tx_monitor_key_down_time = 0;
+static int tx_monitor_key_up_time = 0;
+static int tx_monitor_last_state = 0;  // 0=up, 1=down
+static int tx_monitor_dot_len = 9600;  // Element length at 12 WPM
+
 // build the look-up table from morse_tx_table; called once during initialization
 static void cw_init_morse_lut(void)
 {
@@ -311,6 +319,27 @@ static void cw_init_morse_lut(void)
     }
     // just make sure space is mapped
     morse_lut[(unsigned char)' '] = " ";
+}
+
+// Decode the TX monitor buffer and output to console
+static void tx_monitor_decode(void) {
+	if (tx_monitor_pos == 0)
+		return;
+
+	tx_monitor_code[tx_monitor_pos] = '\0';  // Null terminate
+
+	// Try to match against morse_rx_table
+	for (int i = 0; i < sizeof(morse_rx_table)/sizeof(struct morse_rx); i++) {
+		if (!strcmp(tx_monitor_code, morse_rx_table[i].code)) {
+			write_console(FONT_CW_TX, morse_rx_table[i].c);
+			tx_monitor_pos = 0;
+			return;
+		}
+	}
+
+	// If no match, output the raw code
+	write_console(FONT_CW_TX, tx_monitor_code);
+	tx_monitor_pos = 0;
 }
 
 //the of morse code needs to translate into CW_DOT, CW_DASH, etc
@@ -485,6 +514,55 @@ float cw_tx_get_sample(){
 			}
 		}
 		break;
+	}
+
+	// TX self-monitoring: track keying state to decode what we're sending
+	// Only monitor paddle/key input, not keyboard/macro (which already shows typed chars)
+	int should_monitor = (cw_mode != CW_KBD && cw_current_symbol != CW_IDLE);
+	int current_key_state = (keydown_count > 0) ? 1 : 0;
+
+	if (should_monitor) {
+		// Detect key down transition
+		if (current_key_state == 1 && tx_monitor_last_state == 0) {
+			// Key just went down - check if we had a gap and decode if it was long enough
+			if (tx_monitor_key_up_time > tx_monitor_dot_len / 2) {
+				// Character gap detected - decode what we have
+				tx_monitor_decode();
+			}
+			tx_monitor_key_down_time = 0;
+			tx_monitor_key_up_time = 0;
+		}
+		// Detect key up transition
+		else if (current_key_state == 0 && tx_monitor_last_state == 1) {
+			// Key just went up - determine if it was a dot or dash
+			if (tx_monitor_key_down_time >= tx_monitor_dot_len * 2) {
+				// It was a dash
+				if (tx_monitor_pos < sizeof(tx_monitor_code) - 1) {
+					tx_monitor_code[tx_monitor_pos++] = '-';
+				}
+			} else if (tx_monitor_key_down_time >= tx_monitor_dot_len / 2) {
+				// It was a dot
+				if (tx_monitor_pos < sizeof(tx_monitor_code) - 1) {
+					tx_monitor_code[tx_monitor_pos++] = '.';
+				}
+			}
+			tx_monitor_key_down_time = 0;
+			tx_monitor_key_up_time = 0;
+		}
+
+		// Update timing counters
+		if (current_key_state == 1) {
+			tx_monitor_key_down_time++;
+		} else {
+			tx_monitor_key_up_time++;
+			// Check for word space (long gap)
+			if (tx_monitor_key_up_time > tx_monitor_dot_len * 5 && tx_monitor_pos > 0) {
+				tx_monitor_decode();
+				write_console(FONT_CW_TX, " ");  // Output space for word gap
+			}
+		}
+
+		tx_monitor_last_state = current_key_state;
 	}
 
 	// shape the cw keying
@@ -780,6 +858,14 @@ void cw_init(){
 	keydown_count = 0;
 	keyup_count = 0;
 	cw_envelope = 0;
+
+	// TX self-monitoring initialization
+	tx_monitor_pos = 0;
+	tx_monitor_code[0] = '\0';
+	tx_monitor_key_down_time = 0;
+	tx_monitor_key_up_time = 0;
+	tx_monitor_last_state = 0;
+	tx_monitor_dot_len = 9600;  // At 96ksps, 0.1sec = 1 dot at 12wpm
 }
 
 void cw_poll(int bytes_available, int tx_is_on){
@@ -799,6 +885,7 @@ void cw_poll(int bytes_available, int tx_is_on){
 	cw_bytes_available = bytes_available;
 	int wpm  = field_int("WPM");
 	cw_period = (12 * 9600)/wpm;
+	tx_monitor_dot_len = cw_period;  // Keep TX monitor in sync with WPM
 
 	//retune the rx pitch if needed and update cached TX pitch
 	int cw_rx_pitch = field_int("PITCH");
