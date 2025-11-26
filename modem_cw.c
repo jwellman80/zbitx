@@ -524,8 +524,8 @@ float cw_tx_get_sample(){
 	if (should_monitor) {
 		// Detect key down transition
 		if (current_key_state == 1 && tx_monitor_last_state == 0) {
-			// Key just went down - check if we had a gap and decode if it was long enough
-			if (tx_monitor_key_up_time > tx_monitor_dot_len / 2) {
+			// Key just went down - check if we had a character gap (2.5+ dot lengths)
+			if (tx_monitor_key_up_time > tx_monitor_dot_len * 2) {
 				// Character gap detected - decode what we have
 				tx_monitor_decode();
 			}
